@@ -22,8 +22,8 @@ class AIServiceError(Exception):
 class GeminiAIService:
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-        self.retries = max(0, int(os.getenv("AI_MAX_RETRIES", "3")))
+        self.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
+        self.retries = max(0, min(4, int(os.getenv("AI_MAX_RETRIES", "3"))))
         timeout = float(os.getenv("AI_TIMEOUT_SECONDS", "45"))
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10, write=20, pool=10))
 
@@ -33,25 +33,28 @@ class GeminiAIService:
     async def generate(self, prompt: str, image: bytes | None = None, image_mime: str = "image/jpeg", audio: bytes | None = None, audio_mime: str = "audio/m4a", max_tokens: int = 700) -> str:
         if not self.api_key:
             raise AIServiceError("AI service is not configured on the server.", 503)
-        parts: list[dict[str, Any]] = [{"text": prompt.strip()}]
+        prompt = prompt.strip()
+        if not prompt:
+            raise AIServiceError("AI prompt cannot be empty.", 400)
+        parts: list[dict[str, Any]] = [{"text": prompt}]
         if image is not None:
             parts.append({"inline_data": {"mime_type": image_mime, "data": base64.b64encode(image).decode("ascii")}})
         if audio is not None:
             parts.append({"inline_data": {"mime_type": audio_mime, "data": base64.b64encode(audio).decode("ascii")}})
-        body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": max(64, min(max_tokens, 1200)), "responseMimeType": "application/json"}}
+        body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": max(64, min(max_tokens, 1200)), "responseMimeType": "application/json", "thinkingConfig": {"thinkingBudget": 0}}}
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
         started = time.perf_counter()
         for attempt in range(self.retries + 1):
             try:
-                response = await self.client.post(url, params={"key": self.api_key}, json=body)
+                response = await self.client.post(url, headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"}, json=body)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                if attempt == self.retries:
+                if attempt >= self.retries:
                     LOGGER.exception("AI network/timeout failure")
                     raise AIServiceError("The AI service could not be reached. Please try again.", 504) from exc
-                await asyncio.sleep(min(8, 0.75 * (2 ** attempt)))
+                await asyncio.sleep(min(8.0, 0.75 * (2 ** attempt)))
                 continue
             if response.status_code == 200:
-                LOGGER.info("AI success model=%s elapsed_ms=%d", self.model, int((time.perf_counter()-started)*1000))
+                LOGGER.info("AI success model=%s elapsed_ms=%d", self.model, int((time.perf_counter() - started) * 1000))
                 return self._extract(response)
             retryable = response.status_code == 429 or 500 <= response.status_code < 600
             LOGGER.warning("AI provider status=%s attempt=%d detail=%s", response.status_code, attempt + 1, self._error(response))
@@ -60,7 +63,7 @@ class GeminiAIService:
                     delay = float(response.headers.get("retry-after", ""))
                 except ValueError:
                     delay = 0.75 * (2 ** attempt)
-                await asyncio.sleep(min(8, max(0.5, delay)))
+                await asyncio.sleep(min(8.0, max(0.5, delay)))
                 continue
             if response.status_code == 429:
                 raise AIServiceError("The AI service is temporarily busy. Please try again.", 503)
