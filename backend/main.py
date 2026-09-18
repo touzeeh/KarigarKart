@@ -201,19 +201,87 @@ async def pricing(payload: PricingRequest):
 @app.post("/ai/enhance")
 async def enhance(payload: EnhanceRequest):
     source = (payload.text or payload.description or "").strip()
+
     if not source:
-        raise HTTPException(status_code=400, detail="Text or description is required.")
-    image = None
-    mime = "image/jpeg"
-    if payload.image_base64:
-        image, mime = _decode_data_uri(payload.image_base64)
-    prompt = f"Improve this artisan marketplace description without inventing facts. Category: {payload.category}. Source: {source}. Return JSON only with key enhanced_text. Keep it concise, clear and SEO-friendly."
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "detail": "Text or description is required.",
+            },
+        )
+
+    # Enhancement is text-based. Do not decode or forward the uploaded
+    # image here: this endpoint previously allowed binary JPEG bytes to
+    # enter the response path and trigger FastAPI's UTF-8 encoder.
+    prompt = (
+        "Improve this artisan marketplace description without inventing facts. "
+        f"Category: {payload.category}. "
+        f"Source: {source}. "
+        "Return JSON only with key enhanced_text. "
+        "Keep it concise, clear and SEO-friendly."
+    )
+
     try:
-        parsed = parse_json(await ai.generate(prompt, image=image, image_mime=mime, max_tokens=450))
-        enhanced = str(parsed.get("enhanced_text", "")).strip()
+        parsed = parse_json(
+            await ai.generate(
+                prompt,
+                max_tokens=450,
+            )
+        )
+
+        raw_enhanced = parsed.get("enhanced_text", "")
+
+        if isinstance(raw_enhanced, bytes):
+            enhanced = raw_enhanced.decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
+        else:
+            enhanced = str(raw_enhanced or "").strip()
+
         if not enhanced:
             raise AIServiceError("AI returned no enhanced text.", 502)
-        return {"success": True, "enhanced_text": enhanced, "enhanced_description": enhanced, "text": enhanced}
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "enhanced_text": enhanced,
+                "enhanced_description": enhanced,
+                "text": enhanced,
+            },
+        )
+
     except AIServiceError as exc:
-        LOGGER.warning("Enhance AI failed; returning original text fallback: %s", exc.message)
-        return {"success": True, "enhanced_text": source, "enhanced_description": source, "text": source, "fallback": True, "message": exc.message}
+        LOGGER.warning(
+            "Enhance AI failed; returning original text fallback: %s",
+            exc.message,
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "enhanced_text": source,
+                "enhanced_description": source,
+                "text": source,
+                "fallback": True,
+                "message": str(exc.message),
+            },
+        )
+
+    except Exception as exc:
+        LOGGER.exception("Unexpected enhance failure: %s", exc)
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "enhanced_text": source,
+                "enhanced_description": source,
+                "text": source,
+                "fallback": True,
+                "message": "Enhancement service temporarily unavailable.",
+            },
+        )
